@@ -5,6 +5,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from Basilisk.utilities import SimulationBaseClass, macros, orbitalMotion, simIncludeGravBody
 from Basilisk.simulation import spacecraft, extForceTorque
+from apollo_descent_controller import (
+    ApolloDescentController, DescentParameters, PlanetaryParameters, LandingSiteParameters, SimulationState,
+    FuelConstraint, OrientationConstraint, ThrustRateConstraint
+)
 
 # Create simulation
 scSim = SimulationBaseClass.SimBaseClass()
@@ -29,15 +33,15 @@ moon.isCentralBody = True
 mu = moon.mu
 moon_radius = 1737.4e3
 
-# Initial orbit
-initAlt = 15000
+# Initial orbit over Sea of Tranquility
+initAlt = 16000
 oe = orbitalMotion.ClassicElements()
 oe.a = moon_radius + initAlt
-oe.e = 0.05
-oe.i = 0.0 * macros.D2R
+oe.e = 0.0  # Circular orbit to reduce initial velocity
+oe.i = 0.67 * macros.D2R  # Low inclination orbit for Sea of Tranquility access
 oe.Omega = 0.0
 oe.omega = 0.0
-oe.f = 180.0 * macros.D2R
+oe.f = 0.0 * macros.D2R  # Start at ascending node
 rN, vN = orbitalMotion.elem2rv(mu, oe)
 scObject.hub.r_CN_NInit = rN
 scObject.hub.v_CN_NInit = vN
@@ -59,99 +63,84 @@ samplingTime = simulationTimeStep
 stateLog = scObject.scStateOutMsg.recorder(samplingTime)
 scSim.AddModelToTask(simTaskName, stateLog)
 
-# Constants
-isp = 311.0
-g0 = 9.80665
-max_thrust = 45000.0
+# Setup control parameters
+descent_params = DescentParameters(
+    isp=311.0,
+    g0=9.80665,
+    max_thrust=40000.0,
+    burn_margin=2.0,
+    k_p=1.2,
+    k_horiz=5.0,
+    high_gate_altitude=2500,
+    target_low_gate_altitude=150,
+    target_low_gate_vspeed=-5.0,
+    target_descent_rate=-1.0
+)
+
+planetary_params = PlanetaryParameters(
+    mu=mu,
+    radius=moon_radius
+)
+
+landing_site_params = LandingSiteParameters()  # Defaults to Sea of Tranquility
+
+# Setup constraints
+constraints = [
+    FuelConstraint(min_fuel_margin=50.0),
+    ThrustRateConstraint(max_thrust_rate=40000.0)
+]
+
+# Initialize controller
+controller = ApolloDescentController(descent_params, planetary_params, landing_site_params, constraints)
+
+# Fuel tracking
 fuel_mass = initial_fuel_mass
 initialMass = dry_mass + fuel_mass
-initial_thrust_duration = 10.0
-burn_margin = 1.2
-target_descent_rate = -1.0
-k_p = 0.8
-k_horiz = 0.6
 
 # Initialize
 scSim.InitializeSimulation()
 altitude_log, velocity_log, fuel_mass_log, thrust_mag_log = [], [], [], []
 
 # Run simulation
-high_gate_altitude = 2134
-target_low_gate_altitude = 150
-target_low_gate_vspeed = -5.0
-low_gate_tolerance = 10.0
-entered_low_gate = False
 
 for step in range(int(simulationTime / simulationTimeStep)):
     sim_time = step * macros.NANO2SEC * simulationTimeStep
     scSim.ConfigureStopTime((step + 1) * simulationTimeStep)
 
+    # Get simulation state
     stateData = scObject.scStateOutMsg.read()
     r = np.array(stateData.r_BN_N)
     v = np.array(stateData.v_BN_N)
-
-    altitude = np.linalg.norm(r) - moon_radius
-    r_hat = r / np.linalg.norm(r)
-    v_vert = np.dot(v, r_hat) * r_hat
-    v_horiz = v - v_vert
-    vertical_velocity = np.dot(v, r_hat)
     current_mass = scObject.hub.mHub
-
-    if altitude > high_gate_altitude:
-        # Predictive suicide burn calculation
-        v_total = np.linalg.norm(v)
-        g_moon = mu / np.linalg.norm(r)**2
-        max_a = max_thrust / current_mass - g_moon
-        h_burn = burn_margin * v_total**2 / (2 * max_a) if max_a > 0 else 0
-
-        if altitude <= h_burn:
-            # Begin full suicide burn
-            vel_error_vert = vertical_velocity - target_low_gate_vspeed
-            a_cmd_vert = -k_p * vel_error_vert * r_hat
-            a_cmd_horiz = -k_horiz * v_horiz
-            a_cmd = a_cmd_vert + a_cmd_horiz
-            thrust_cmd = current_mass * a_cmd
-            thrust_mag = np.linalg.norm(thrust_cmd)
-            if thrust_mag > max_thrust:
-                thrust_cmd *= max_thrust / thrust_mag
-        else:
-            # Coasting
-            thrust_cmd = np.zeros(3)
-
-    elif high_gate_altitude >= altitude > target_low_gate_altitude:
-        # Approach phase - aim to zero horizontal and reduce vertical to target low gate speed
-        vel_error_vert = vertical_velocity - target_low_gate_vspeed
-        a_cmd_vert = -k_p * vel_error_vert * r_hat
-        a_cmd_horiz = -k_horiz * v_horiz
-        a_cmd = a_cmd_vert + a_cmd_horiz
-        thrust_cmd = current_mass * a_cmd
-        thrust_mag = np.linalg.norm(thrust_cmd)
-        if thrust_mag > max_thrust:
-            thrust_cmd *= max_thrust / thrust_mag
-
-    else:
-        # Terminal descent
-        if not entered_low_gate:
-            print(f"Entered Low Gate at t={sim_time:.2f} s with vertical speed: {vertical_velocity:.2f} m/s")
-            entered_low_gate = True
-
-        vel_error_vert = vertical_velocity - target_descent_rate
-        a_cmd_vert = -k_p * vel_error_vert * r_hat
-        a_cmd_horiz = -k_horiz * v_horiz
-        a_cmd = a_cmd_vert + a_cmd_horiz
-        thrust_cmd = current_mass * a_cmd
-        thrust_mag = np.linalg.norm(thrust_cmd)
-        if thrust_mag > max_thrust:
-            thrust_cmd *= max_thrust / thrust_mag
-
-    thrust_mag = np.linalg.norm(thrust_cmd)
-    mdot = thrust_mag / (isp * g0)
+    
+    # Create simulation state for controller
+    sim_state = SimulationState(
+        position=r,
+        velocity=v,
+        mass=current_mass,
+        time=sim_time,
+        fuel_mass=fuel_mass,
+        attitude_quaternion=None
+    )
+    
+    # Get control command from controller
+    control_cmd = controller.update(sim_state)
+    thrust_cmd = control_cmd.thrust_vector
+    mdot = control_cmd.fuel_consumption_rate
+    
+    # Log constraint information if applicable
+    if control_cmd.is_constrained and step % 20 == 0:
+        print(f"t={sim_time:.1f}s: {control_cmd.constraint_info}")
+    
+    # Update fuel mass
     dm = mdot * macros.NANO2SEC * simulationTimeStep
     fuel_mass -= dm
     fuel_mass = max(fuel_mass, 0.0)
 
     if fuel_mass <= 0:
         thrust_cmd = np.zeros(3)
+    
+    altitude = np.linalg.norm(r) - moon_radius
 
     scObject.hub.mHub = dry_mass + fuel_mass
     thrustForce.extForce_N = thrust_cmd.reshape(3, 1)
@@ -159,7 +148,7 @@ for step in range(int(simulationTime / simulationTimeStep)):
     altitude_log.append(altitude)
     velocity_log.append(np.linalg.norm(v))
     fuel_mass_log.append(fuel_mass)
-    thrust_mag_log.append(thrust_mag)
+    thrust_mag_log.append(np.linalg.norm(thrust_cmd))
 
     scSim.ExecuteSimulation()
 
